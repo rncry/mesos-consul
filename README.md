@@ -1,6 +1,8 @@
 # mesos-consul
 
-Mesos to Consul bridge for service discovery. 
+[![Build Status](https://travis-ci.org/CiscoCloud/mesos-consul.svg)](https://travis-ci.org/CiscoCloud/mesos-consul)
+
+Mesos to Consul bridge for service discovery.
 
 Mesos-consul automatically registers/deregisters services run as Mesos tasks.
 
@@ -44,7 +46,7 @@ Registrator is another tool that populates Consul (and other backends like etcd)
 
 ## Building
 ```
-docker build -t mesos-consul . 
+docker build -t mesos-consul .
 ```
 
 ## Running
@@ -60,7 +62,7 @@ Where `mesos-consul.json` is similar to (replacing the image with your image):
 ```
 {
   "args": [
-    "--zk=zk://zookeeper.service.consul:2181/mesos",
+    "--zk=zk://zookeeper.service.consul:2181/mesos"
   ],  
   "container": {
     "type": "DOCKER",
@@ -72,7 +74,7 @@ Where `mesos-consul.json` is similar to (replacing the image with your image):
   "id": "mesos-consul",
   "instances": 1,
   "cpus": 0.1,
-  "mem": 256 
+  "mem": 256
 }
 
 
@@ -87,21 +89,32 @@ You can add options to authenticate via basic http or Consul token.
 
 |         Option        | Description |
 |-----------------------|-------------|
+| `version`             | Print mesos-consul version
 | `refresh`             | Time between refreshes of Mesos tasks
-| `registry-auth`       | The basic authentication username (and optional password), separated by a colon.
-| `registry-ssl`        | Use HTTPS while talking to the registry.
-| `registry-ssl-verify` | Verify certificates when connecting via SSL.
-| `registry-ssl-cert`   | Path to an SSL certificate to use to authenticate to the registry server
-| `registry-ssl-cacert` | Path to a CA certificate file, containing one or more CA certificates to use to valid the reigstry server certificate
-| `registry-token`      | The registry ACL token
-| `zk`*                 | Location of the Mesos path in Zookeeper. The default value is zk://127.0.0.1:2181/mesos
+| `mesos-ip-order`             | Comma separated list to control the order in which github.com/CiscoCloud/mesos-consul searches or the task IP address. Valid options are 'netinfo', 'mesos', 'docker' and 'host' (default netinfo,mesos,host)
+| `healthcheck`             | Enables a http endpoint for health checks. When this flag is enabled, serves health status on 127.0.0.1:24476
+| `healthcheck-ip`             | Health check service interface ip (default 127.0.0.1)
+| `healthcheck-port`             | Health check service port. (default 24476)
+| `consul-auth`       | The basic authentication username (and optional password), separated by a colon.
+| `consul-ssl`        | Use HTTPS while talking to the registry.
+| `consul-ssl-verify` | Verify certificates when connecting via SSL.
+| `consul-ssl-cert`   | Path to an SSL certificate to use to authenticate to the registry server
+| `consul-ssl-cacert` | Path to a CA certificate file, containing one or more CA certificates to use to valid the registry server certificate
+| `consul-token`      | The registry ACL token
+| `heartbeats-before-remove` | Number of times that registration needs to fail before removing task from Consul. (default: 1)
+| `whitelist`         | Only register services matching the provided regex. Can be specified multitple time
+| `blacklist`         | Does not register services matching the provided regex. Can be specified multitple time
+| `service-name=<name>`      | Service name of the Mesos hosts
+| `service-tags=<tag>,...` | Comma delimited list of tags to register the Mesos hosts. Mesos hosts will be registered as (leader|master|follower).<tag>.<service>.service.consul
+| `zk`\*                 | Location of the Mesos path in Zookeeper. The default value is zk://127.0.0.1:2181/mesos
+| `group-separator`      | Choose the group separator. Will replace _ in task names (default is empty)
 
 
 ### Consul Registration
 
 #### Leader, Master and Follower Nodes
 
-|    Role    | Registration 
+|    Role    | Registration
 |------------|--------------
 | `Leader`   | `leader.mesos.service.consul`, `master.mesos.service.consul`
 | `Master`   | `master.mesos.service.consul`
@@ -111,8 +124,44 @@ You can add options to authenticate via basic http or Consul token.
 
 Tasks are registered as `task_name.service.consul`
 
+#### Tags
+
+Tags can be added to consul by using labels in Mesos. If you are using Marathon you can add a label called `tags` to your service definition with a  comma-separated list of strings that will be registered in consul as tags.
+
+For example, in your marathon service definition:
+
+```
+{
+  "id": "tagging-test",
+  "container": { /*...*/},
+  "labels": {
+    "tags": "label1,label2,label3"
+  }
+}
+```
+
+This will result in a service `tagging-test` being created in consul with 3 separate tags: `label1` `label2` and `label3`
+
+```
+// GET /v1/catalog/service/tagging-test
+[
+  {
+    Node: "consul",
+    Address: "10.0.2.15",
+    ServiceID: "mesos-consul:10.0.2.15:tagging-test:31562",
+    ServiceName: "tagging-test5",
+    ServiceTags: [
+      "label1",
+      "label2",
+      "label3"
+    ],
+    ServiceAddress: "10.0.2.15",
+    ServicePort: 31562
+  }
+]
+```
+
 ## Todo
 
-  * Add support for tags
   * Use task labels for metadata
   * Support for multiple port tasks

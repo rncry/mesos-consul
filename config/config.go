@@ -4,40 +4,35 @@ import (
 	"time"
 )
 
-type Auth struct {
-	Enabled		bool
-	Username	string
-	Password	string
-}
-
-type SSL struct {
-	Enabled		bool
-	Verify		bool
-	Cert		string
-	CaCert		string
-}
-
 type Config struct {
-	Refresh		time.Duration
-	RegistryAuth	*Auth
-	RegistryPort	string
-	RegistrySSL	*SSL
-	RegistryToken	string
-	Zk		string
-	LogLevel	string
+	Refresh         time.Duration
+	Zk              string
+	LogLevel        string
+	MesosIpOrder    string
+	Healthcheck     bool
+	HealthcheckIp   string
+	HealthcheckPort string
+	WhiteList       []string
+	BlackList       []string
+	Separator       string
+
+	// Mesos service name and tags
+	ServiceName string
+	ServiceTags string
 }
 
 func DefaultConfig() *Config {
 	return &Config{
-		Refresh:	time.Minute,
-		RegistryAuth:	&Auth{
-			Enabled: false,
-		},
-		RegistrySSL:	&SSL{
-			Enabled: false,
-			Verify: true,
-		},
-		RegistryToken:	"",
-		Zk:		"zk://127.0.0.1:2181/mesos",
+		Refresh:         time.Minute,
+		Zk:              "zk://127.0.0.1:2181/mesos",
+		MesosIpOrder:    "netinfo,mesos,host",
+		Healthcheck:     false,
+		HealthcheckIp:   "127.0.0.1",
+		HealthcheckPort: "24476",
+		WhiteList:       []string{},
+		BlackList:       []string{},
+		Separator:       "",
+		ServiceName:     "mesos",
+		ServiceTags:     "",
 	}
 }

@@ -3,36 +3,110 @@ package mesos
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
-	"strconv"
+	"regexp"
 	"strings"
 	"sync"
 
 	"github.com/CiscoCloud/mesos-consul/config"
 	"github.com/CiscoCloud/mesos-consul/consul"
+	"github.com/CiscoCloud/mesos-consul/registry"
+	"github.com/CiscoCloud/mesos-consul/state"
 
 	consulapi "github.com/hashicorp/consul/api"
+	proto "github.com/mesos/mesos-go/mesosproto"
+	log "github.com/sirupsen/logrus"
 )
 
-type Mesos struct {
-	Consul		*consul.Consul
-	Masters		*[]MesosHost
-	Lock		sync.Mutex
+type CacheEntry struct {
+	service      *consulapi.AgentServiceRegistration
+	isRegistered bool
 }
 
-func New(c *config.Config, consul *consul.Consul) *Mesos{
+type Mesos struct {
+	Registry registry.Registry
+	Agents   map[string]string
+	Lock     sync.Mutex
+
+	Leader    *proto.MasterInfo
+	Masters   []*proto.MasterInfo
+	started   sync.Once
+	startChan chan struct{}
+
+	IpOrder        []string
+	WhiteList      string
+	whitelistRegex *regexp.Regexp
+	BlackList      string
+	blacklistRegex *regexp.Regexp
+
+	Separator string
+
+	ServiceName string
+	ServiceTags []string
+}
+
+func New(c *config.Config) *Mesos {
 	m := new(Mesos)
 
 	if c.Zk == "" {
 		return nil
 	}
+	m.Separator = c.Separator
 
-	m.Consul = consul
+	if len(c.WhiteList) > 0 {
+		m.WhiteList = strings.Join(c.WhiteList, "|")
+		log.WithField("whitelist", m.WhiteList).Debug("Using whitelist regex")
+		re, err := regexp.Compile(m.WhiteList)
+		if err != nil {
+			// For now, exit if the regex fails to compile. If we read regexes from Consul
+			// maybe we emit a warning and use the old regex
+			//
+			log.WithField("whitelist", m.WhiteList).Fatal("WhiteList regex failed to compile")
+		}
+		m.whitelistRegex = re
+	} else {
+		m.whitelistRegex = nil
+	}
+
+	if len(c.BlackList) > 0 {
+		m.BlackList = strings.Join(c.BlackList, "|")
+		log.WithField("blacklist", m.BlackList).Debug("Using blacklist regex")
+		re, err := regexp.Compile(m.BlackList)
+		if err != nil {
+			// For now, exit if the regex fails to compile. If we read regexes from Consul
+			// maybe we emit a warning and use the old regex
+			//
+			log.WithField("blacklist", m.BlackList).Fatal("BlackList regex failed to compile")
+		}
+		m.blacklistRegex = re
+	} else {
+		m.blacklistRegex = nil
+	}
+
+	m.ServiceName = cleanName(c.ServiceName, c.Separator)
+
+	m.Registry = consul.New()
+
+	if m.Registry == nil {
+		log.Fatal("No registry specified")
+	}
 
 	m.zkDetector(c.Zk)
+
+	m.IpOrder = strings.Split(c.MesosIpOrder, ",")
+	for _, src := range m.IpOrder {
+		switch src {
+		case "netinfo", "host", "docker", "mesos":
+		default:
+			log.Fatalf("Invalid IP Search Order: '%v'", src)
+		}
+	}
+	log.Debugf("m.IpOrder = '%v'", m.IpOrder)
+
+	if c.ServiceTags != "" {
+		m.ServiceTags = strings.Split(c.ServiceTags, ",")
+	}
 
 	return m
 }
@@ -40,12 +114,16 @@ func New(c *config.Config, consul *consul.Consul) *Mesos{
 func (m *Mesos) Refresh() error {
 	sj, err := m.loadState()
 	if err != nil {
-		log.Print("[ERROR] No master")
+		log.Warn("loadState failed: ", err.Error())
 		return err
 	}
-	
-	if (sj.Leader == "") {
+
+	if sj.Leader == "" {
 		return errors.New("Empty master")
+	}
+
+	if m.Registry.CacheCreate() {
+		m.LoadCache()
 	}
 
 	m.parseState(sj)
@@ -53,9 +131,11 @@ func (m *Mesos) Refresh() error {
 	return nil
 }
 
-func (m *Mesos) loadState() (StateJSON, error) {
+func (m *Mesos) loadState() (state.State, error) {
 	var err error
-	var sj StateJSON
+	var sj state.State
+
+	log.Debug("loadState() called")
 
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -63,25 +143,26 @@ func (m *Mesos) loadState() (StateJSON, error) {
 		}
 	}()
 
-	ip, port := m.getLeader()
-	if ip == "" {
+	mh := m.getLeader()
+	if mh.Ip == "" {
+		log.Warn("No master in zookeeper")
 		return sj, errors.New("No master in zookeeper")
 	}
 
-	log.Printf("[INFO] Zookeeper leader: %s:%s", ip, port)
+	log.Infof("Zookeeper leader: %s:%s", mh.Ip, mh.PortString)
 
-	log.Print("[INFO] reloading from master ", ip)
-	sj = m.loadFromMaster(ip, port)
+	log.Info("reloading from master ", mh.Ip)
+	sj = m.loadFromMaster(mh.Ip, mh.PortString)
 
-	if rip := leaderIP(sj.Leader); rip != ip {
-		log.Print("[WARN] master changed to ", rip)
-		sj = m.loadFromMaster(rip, port)
+	if rip := leaderIP(sj.Leader); rip != mh.Ip {
+		log.Warn("master changed to ", rip)
+		sj = m.loadFromMaster(rip, mh.PortString)
 	}
 
 	return sj, err
 }
 
-func (m *Mesos) loadFromMaster(ip string, port string) (sj StateJSON) {
+func (m *Mesos) loadFromMaster(ip string, port string) (sj state.State) {
 	url := "http://" + ip + ":" + port + "/master/state.json"
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -90,68 +171,38 @@ func (m *Mesos) loadFromMaster(ip string, port string) (sj StateJSON) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Fatal("[ERROR] ", err)
+		log.Fatal(err)
 	}
 
 	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		log.Fatal("[ERROR] ", err)
+		log.Fatal(err)
 	}
 
 	err = json.Unmarshal(body, &sj)
 	if err != nil {
-		log.Fatal("[ERROR] ", err)
+		log.Fatal(err)
 	}
 
 	return sj
 }
 
-func (m *Mesos) parseState(sj StateJSON) {
-	log.Print("[INFO] Running parseState")
+func (m *Mesos) parseState(sj state.State) {
+	log.Info("Running parseState")
 
 	m.RegisterHosts(sj)
-	log.Print("[DEBUG] Done running RegisterHosts")
+	log.Debug("Done running RegisterHosts")
 
 	for _, fw := range sj.Frameworks {
 		for _, task := range fw.Tasks {
-			host, err := sj.Followers.hostById(task.FollowerId)
-			if err == nil && task.State == "TASK_RUNNING" {
-				tname := cleanName(task.Name)
-				if task.Resources.Ports != "" {
-					for _, port := range yankPorts(task.Resources.Ports) {
-						m.register(&consulapi.AgentServiceRegistration{
-							ID:	fmt.Sprintf("%s:%s:%d",host,tname,port),
-							Name:	tname,
-							Port:	port,
-							Address: toIP(host),
-							})
-					}
-				}
+			agent, ok := m.Agents[task.SlaveID]
+			if ok && task.State == "TASK_RUNNING" {
+				task.SlaveIP = agent
+				m.registerTask(&task, agent)
 			}
 		}
 	}
 
-	// Remove completed tasks
-	m.deregister()
-}
-
-func yankPorts(ports string) []int {
-	rhs := strings.Split(ports, "[")[1]
-	lhs := strings.Split(rhs, "]")[0]
-
-	yports := []int{}
-
-	mports := strings.Split(lhs, ",")
-	for _,mport := range mports {
-		pz := strings.Split(strings.TrimSpace(mport), "-")
-		lo, _ := strconv.Atoi(pz[0])
-		hi, _ := strconv.Atoi(pz[1])
-
-		for t := lo; t <= hi; t++ {
-			yports = append(yports, t)
-		}
-	}
-
-	return yports
+	m.Registry.Deregister()
 }

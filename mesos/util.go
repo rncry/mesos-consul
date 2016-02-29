@@ -1,54 +1,54 @@
 package mesos
 
 import (
-	"log"
 	"net"
 	"regexp"
 	"strconv"
 	"strings"
+
+	log "github.com/sirupsen/logrus"
 )
 
-func cleanName(name string) string {
-	reg, err := regexp.Compile("[^\\w-.\\.]")
+func cleanName(name string, separator string) string {
+	reg, err := regexp.Compile("[^\\w-]")
 	if err != nil {
-		log.Print("[WARN] ", err)
+		log.Warn(err)
 		return name
 	}
 
-	s := reg.ReplaceAllString(name, "")
+	s := reg.ReplaceAllString(name, "-")
 
-	return strings.ToLower(strings.Replace(s, "_", "", -1))
+	return strings.ToLower(strings.Replace(s, "_", separator, -1))
 }
 
-// The PID has a specific format:
-// type@host:port
-func parsePID(pid string) (string, string) {
-	host := strings.Split(strings.Split(pid, ":")[0], "@")[1]
-	port := strings.Split(pid, ":")[1]
-
-	return host, port
-}
-	
 func leaderIP(leader string) string {
 	host := strings.Split(leader, "@")[1]
 	host = strings.Split(host, ":")[0]
 
-	return host
+	return toIP(host)
 }
 
 func toIP(host string) string {
-	ip, err := net.LookupIP(host)
-	if err != nil {
+	// Check if host string is already an IP address
+	ip := net.ParseIP(host)
+	if ip != nil {
 		return host
 	}
 
-	return ip[0].String()
+	// Try to resolve host
+	i, err := net.ResolveIPAddr("ip4", host)
+	if err != nil {
+		// Return the hostname if unable to resolve
+		return host
+	}
+
+	return i.String()
 }
 
 func toPort(p string) int {
 	ps, err := strconv.Atoi(p)
 	if err != nil {
-		log.Printf("[ERROR] Invalid port number: %s", p)
+		log.Warnf("Invalid port number: %s", p)
 	}
 
 	return ps

@@ -2,36 +2,51 @@ package mesos
 
 import (
 	"fmt"
-	"log"
+	"strconv"
+	"strings"
 
-	consulapi "github.com/hashicorp/consul/api"
+	"github.com/CiscoCloud/mesos-consul/registry"
+	"github.com/CiscoCloud/mesos-consul/state"
+
+	log "github.com/sirupsen/logrus"
 )
 
-type cacheEntry struct {
-	service		*consulapi.AgentServiceRegistration
-	isRegistered	bool
+// Query the consul agent on the Mesos Master
+// to initialize the cache.
+//
+// All services created by mesos-consul are prefixed
+// with `mesos-consul:`
+//
+func (m *Mesos) LoadCache() error {
+	log.Debug("Populating cache from Consul")
+
+	mh := m.getLeader()
+
+	return m.Registry.CacheLoad(mh.Ip)
 }
 
-var cache = make(map[string]*cacheEntry)
+func (m *Mesos) RegisterHosts(s state.State) {
+	log.Debug("Running RegisterHosts")
 
-func (m *Mesos) RegisterHosts(sj StateJSON) {
-	log.Print("[INFO] Running RegisterHosts")
+	m.Agents = make(map[string]string)
 
-	// Register followers
-	for _, f := range sj.Followers {
-		h, p := parsePID(f.Pid)
-		host := toIP(h)
-		port := toPort(p)
+	// Register slaves
+	for _, f := range s.Slaves {
+		agent := toIP(f.PID.Host)
+		port := toPort(f.PID.Port)
 
-		m.registerHost(&consulapi.AgentServiceRegistration{
-			ID:		fmt.Sprintf("%s:%s", f.Id, f.Hostname),
-			Name:		"mesos",
-			Port:		port,
-			Address:	host,
-			Tags:		[]string{ "follower" },
-			Check:		&consulapi.AgentServiceCheck{
-				HTTP:		fmt.Sprintf("http://%s:%d/slave(1)/health", host, port),
-				Interval:	"10s",
+		m.Agents[f.ID] = agent
+
+		m.registerHost(&registry.Service{
+			ID:      fmt.Sprintf("mesos-consul:%s:%s:%s", m.ServiceName, f.ID, f.Hostname),
+			Name:    m.ServiceName,
+			Port:    port,
+			Address: agent,
+			Agent:   agent,
+			Tags:    m.agentTags("agent", "follower"),
+			Check: &registry.Check{
+				HTTP:     fmt.Sprintf("http://%s:%d/slave(1)/health", agent, port),
+				Interval: "10s",
 			},
 		})
 	}
@@ -41,22 +56,21 @@ func (m *Mesos) RegisterHosts(sj StateJSON) {
 	for _, ma := range mas {
 		var tags []string
 
-		if ma.isLeader {
-			tags = []string{ "leader", "master" }
+		if ma.IsLeader {
+			tags = m.agentTags("leader", "master")
 		} else {
-			tags = []string{ "master" }
+			tags = m.agentTags("master")
 		}
-		host := toIP(ma.host)
-		port := toPort(ma.port)
-		s := &consulapi.AgentServiceRegistration{
-			ID:		fmt.Sprintf("mesos:%s:%s", ma.host, ma.port),
-			Name:		"mesos",
-			Port:		port,
-			Address:	host,
-			Tags:		tags,
-			Check:		&consulapi.AgentServiceCheck{
-				HTTP:		fmt.Sprintf("http://%s:%d/master/health", host, port),
-				Interval:	"10s",
+		s := &registry.Service{
+			ID:      fmt.Sprintf("mesos-consul:%s:%s:%s", m.ServiceName, ma.Ip, ma.PortString),
+			Name:    m.ServiceName,
+			Port:    ma.Port,
+			Address: ma.Ip,
+			Agent:   ma.Ip,
+			Tags:    tags,
+			Check: &registry.Check{
+				HTTP:     fmt.Sprintf("http://%s:%d/master/health", ma.Ip, ma.Port),
+				Interval: "10s",
 			},
 		}
 
@@ -71,7 +85,7 @@ func sliceEq(a, b []string) bool {
 		return false
 	}
 
-	for i := range a{
+	for i := range a {
 		if a[i] != b[i] {
 			return false
 		}
@@ -80,67 +94,120 @@ func sliceEq(a, b []string) bool {
 	return true
 }
 
-func (m *Mesos) registerHost(s *consulapi.AgentServiceRegistration) {
+func (m *Mesos) registerHost(s *registry.Service) {
+	h := m.Registry.CacheLookup(s.ID)
+	if h != nil {
+		log.Infof("Host found. Comparing tags: (%v, %v)", h.Tags, s.Tags)
 
-	if _, ok := cache[s.ID]; ok {
-		log.Printf("[INFO] Host found. Comparing tags: (%v, %v)", cache[s.ID].service.Tags, s.Tags)
-
-		if sliceEq(s.Tags, cache[s.ID].service.Tags) {
-			cache[s.ID].isRegistered = true
+		if sliceEq(s.Tags, h.Tags) {
+			m.Registry.CacheMark(s.ID)
 
 			// Tags are the same. Return
 			return
 		}
 
-		log.Println("[INFO] Tags changed. Re-registering")
+		log.Info("Tags changed. Re-registering")
 
 		// Delete cache entry. It will be re-created below
-		delete(cache, s.ID)
+		m.Registry.CacheDelete(s.ID)
 	}
 
-	cache[s.ID] = &cacheEntry{
-		service:		s,
-		isRegistered:		true,
-	}
-
-
-	err := m.Consul.Register(s)
-	if err != nil {
-		log.Print("[ERROR] ", err)
-	}
+	m.Registry.Register(s)
 }
 
-func (m *Mesos) register(s *consulapi.AgentServiceRegistration) {
-	if _, ok := cache[s.ID]; ok {
-		log.Printf("[INFO] Service found. Not registering: %s", s.ID)
-		cache[s.ID].isRegistered = true
-		return
-	}
+func (m *Mesos) registerTask(t *state.Task, agent string) {
+	var tags []string
 
-	log.Print("[INFO] Registering ", s.ID)
-
-	cache[s.ID] = &cacheEntry{
-		service:		s,
-		isRegistered:		true,
-	}
-
-	err := m.Consul.Register(s)
-	if err != nil {
-		log.Print("[ERROR] ", err)
-	}
-}
-
-// deregister items that have gone away
-//
-func (m *Mesos) deregister() {
-	for s, b := range cache {
-		if !b.isRegistered {
-			log.Print("[INFO] Deregistering ", s)
-			m.Consul.Deregister(b.service)
-
-			delete(cache, s)
-		} else {
-			cache[s].isRegistered = false
+	tname := cleanName(t.Name, m.Separator)
+	if m.whitelistRegex != nil {
+		if !m.whitelistRegex.MatchString(tname) {
+			log.WithField("task", tname).Debug("Task not on whitelist")
+			// No match
+			return
 		}
 	}
+	if m.blacklistRegex != nil {
+		if m.blacklistRegex.MatchString(tname) {
+			log.WithField("task", tname).Debug("Task on blacklist")
+			// Match
+			return
+		}
+	}
+
+	address := t.IP(m.IpOrder...)
+
+	l := t.Label("tags")
+	if l != "" {
+		tags = strings.Split(t.Label("tags"), ",")
+	} else {
+		tags = []string{}
+	}
+
+	for key := range t.DiscoveryInfo.Ports.DiscoveryPorts {
+		discoveryPort := state.DiscoveryPort(t.DiscoveryInfo.Ports.DiscoveryPorts[key])
+		serviceName := discoveryPort.Name
+		servicePort := strconv.Itoa(discoveryPort.Number)
+		log.Debugf("%+v framework has %+v as a name for %+v port",
+			t.Name,
+			discoveryPort.Name,
+			discoveryPort.Number)
+		if discoveryPort.Name != "" {
+			m.Registry.Register(&registry.Service{
+				ID:      fmt.Sprintf("mesos-consul:%s:%s:%d", agent, tname, discoveryPort.Number),
+				Name:    tname,
+				Port:    toPort(servicePort),
+				Address: address,
+				Tags:    []string{serviceName},
+				Check: GetCheck(t, &CheckVar{
+					Host: toIP(address),
+					Port: servicePort,
+				}),
+				Agent: toIP(agent),
+			})
+		}
+	}
+
+	if t.Resources.PortRanges != "" {
+		for _, port := range t.Resources.Ports() {
+			m.Registry.Register(&registry.Service{
+				ID:      fmt.Sprintf("mesos-consul:%s:%s:%s", agent, tname, port),
+				Name:    tname,
+				Port:    toPort(port),
+				Address: address,
+				Tags:    tags,
+				Check: GetCheck(t, &CheckVar{
+					Host: toIP(address),
+					Port: port,
+				}),
+				Agent: toIP(agent),
+			})
+		}
+	} else {
+		m.Registry.Register(&registry.Service{
+			ID:      fmt.Sprintf("mesos-consul:%s-%s", agent, tname),
+			Name:    tname,
+			Address: address,
+			Tags:    tags,
+			Check: GetCheck(t, &CheckVar{
+				Host: toIP(address),
+			}),
+			Agent: toIP(agent),
+		})
+	}
+}
+
+func (m *Mesos) agentTags(ts ...string) []string {
+	if len(m.ServiceTags) == 0 {
+		return ts
+	}
+
+	rval := []string{}
+
+	for _, tag := range m.ServiceTags {
+		for _, t := range ts {
+			rval = append(rval, fmt.Sprintf("%s.%s", t, tag))
+		}
+	}
+
+	return rval
 }

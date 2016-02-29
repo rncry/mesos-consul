@@ -11,6 +11,7 @@ RUN cd /go/src/github.com/CiscoCloud/mesos-consul \
 	&& go get \
 	&& go build -o /bin/mesos-consul \
 	&& rm -rf /go \
-	&& apt-get remove -y golang git
+	&& apk del --purge go git mercurial
+
 
 ENTRYPOINT [ "/bin/mesos-consul" ]
